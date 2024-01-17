@@ -22,7 +22,7 @@
 #include <Kokkos_Core.hpp>
 #include <iostream>
 #include <string>
-//#define VERBOSE
+// #define VERBOSE
 
 #ifdef KOKKOSKERNELS_ENABLE_TPL_ROCSPARSE
 #include "KokkosSparse_Utils_rocsparse.hpp"
@@ -34,6 +34,10 @@
 
 #ifdef KOKKOSKERNELS_ENABLE_TPL_MKL
 #include "KokkosSparse_Utils_mkl.hpp"
+#endif
+
+#if defined(KOKKOSKERNELS_ENABLE_TPL_MKL) && defined(KOKKOS_ENABLE_SYCL)
+#include <oneapi/mkl/blas.hpp>
 #endif
 
 namespace KokkosSparse {
@@ -183,10 +187,10 @@ class SPGEMMHandle {
     void *buffer3, *buffer4, *buffer5;
 
     cuSparseSpgemmHandleType(bool transposeA, bool transposeB) {
-      opA = transposeA ? CUSPARSE_OPERATION_TRANSPOSE
-                       : CUSPARSE_OPERATION_NON_TRANSPOSE;
-      opB = transposeB ? CUSPARSE_OPERATION_TRANSPOSE
-                       : CUSPARSE_OPERATION_NON_TRANSPOSE;
+      opA        = transposeA ? CUSPARSE_OPERATION_TRANSPOSE
+                              : CUSPARSE_OPERATION_NON_TRANSPOSE;
+      opB        = transposeB ? CUSPARSE_OPERATION_TRANSPOSE
+                              : CUSPARSE_OPERATION_NON_TRANSPOSE;
       scalarType = Impl::cuda_data_type_from<nnz_scalar_t>();
 
       alg         = CUSPARSE_SPGEMM_DEFAULT;
@@ -242,6 +246,24 @@ class SPGEMMHandle {
     }
 
     sparse_matrix_t C;
+  };
+#endif
+
+#if defined(KOKKOSKERNELS_ENABLE_TPL_MKL) && defined(KOKKOS_ENABLE_SYCL)
+  struct oneMKLSpgemmHandleType {
+    oneapi::mkl::sparse::matmat_descr_t descr     = nullptr;
+    oneapi::mkl::sparse::matrix_handle_t handle_A = nullptr;
+    oneapi::mkl::sparse::matrix_handle_t handle_B = nullptr;
+    oneapi::mkl::sparse::matrix_handle_t handle_C = nullptr;
+    std::int64_t *sizeTempBuffer1 = nullptr;  // host accessible USM
+    std::int64_t *sizeTempBuffer2 = nullptr;
+    void *tempBuffer1             = nullptr;  // device buffer
+    void *tempBuffer2             = nullptr;
+
+    oneapi::mkl::transpose opA;
+
+
+
   };
 #endif
 
@@ -359,6 +381,13 @@ class SPGEMMHandle {
 #ifdef KOKKOSKERNELS_ENABLE_TPL_MKL
  private:
   mklSpgemmHandleType *mkl_spgemm_handle;
+
+ public:
+#endif
+
+#if defined(KOKKOSKERNELS_ENABLE_TPL_MKL) && defined(KOKKOS_ENABLE_SYCL)
+ private:
+  oneMKLSpgemmHandleType *onemkl_spgemm_handle;
 
  public:
 #endif
@@ -618,6 +647,8 @@ class SPGEMMHandle {
     return this->mkl_spgemm_handle;
   }
 #endif
+
+
 
   void choose_default_algorithm() {
 #if defined(KOKKOS_ENABLE_SERIAL)

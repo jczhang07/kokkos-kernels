@@ -19,6 +19,9 @@
 #ifndef KOKKOSPARSE_SPGEMM_SYMBOLIC_TPL_SPEC_AVAIL_HPP_
 #define KOKKOSPARSE_SPGEMM_SYMBOLIC_TPL_SPEC_AVAIL_HPP_
 
+#include "Kokkos_Macros.hpp.hpp"
+#include "KokkosKernels_config.h"
+
 #ifdef KOKKOSKERNELS_ENABLE_TPL_MKL
 #include <mkl.h>
 #endif
@@ -145,33 +148,33 @@ SPGEMM_SYMBOLIC_AVAIL_MKL_E(Kokkos::OpenMP)
 #endif
 
 #if defined(KOKKOS_ENABLE_SYCL)
-#define SPGEMM_SYMBOLIC_AVAIL_MKL_SYCL(SCALAR, ORDINAL)			     \
+#define SPGEMM_SYMBOLIC_AVAIL_MKL_SYCL(SCALAR, ORDINAL)                      \
   template <>                                                                \
   struct spgemm_symbolic_tpl_spec_avail<                                     \
       KokkosKernels::Experimental::KokkosKernelsHandle<                      \
-	  const ORDINAL, const ORDINAL, const SCALAR,                        \
-	  Kokkos::Experimental::SYCL,                                        \
-	  Kokkos::Experimental::SYCLDeviceUSMSpace,                          \
+          const ORDINAL, const ORDINAL, const SCALAR,                        \
+          Kokkos::Experimental::SYCL,                                        \
+          Kokkos::Experimental::SYCLDeviceUSMSpace,                          \
           Kokkos::Experimental::SYCLDeviceUSMSpace>,                         \
       Kokkos::View<const ORDINAL *, default_layout,                          \
                    Kokkos::Device<Kokkos::Experimental::SYCL,                \
-				  Kokkos::Experimental::SYCLDeviceUSMSpace>, \
+                                  Kokkos::Experimental::SYCLDeviceUSMSpace>, \
                    Kokkos::MemoryTraits<Kokkos::Unmanaged> >,                \
       Kokkos::View<const ORDINAL *, default_layout,                          \
-                   Kokkos::Device<Kokkos::Experimental::SYCL,		     \
-				  Kokkos::Experimental::SYCLDeviceUSMSpace>, \
+                   Kokkos::Device<Kokkos::Experimental::SYCL,                \
+                                  Kokkos::Experimental::SYCLDeviceUSMSpace>, \
                    Kokkos::MemoryTraits<Kokkos::Unmanaged> >,                \
       Kokkos::View<const ORDINAL *, default_layout,                          \
-                   Kokkos::Device<Kokkos::Experimental::SYCL,		     \
-				  Kokkos::Experimental::SYCLDeviceUSMSpace>, \
+                   Kokkos::Device<Kokkos::Experimental::SYCL,                \
+                                  Kokkos::Experimental::SYCLDeviceUSMSpace>, \
                    Kokkos::MemoryTraits<Kokkos::Unmanaged> >,                \
       Kokkos::View<const ORDINAL *, default_layout,                          \
-                   Kokkos::Device<Kokkos::Experimental::SYCL,		     \
-				  Kokkos::Experimental::SYCLDeviceUSMSpace>, \
+                   Kokkos::Device<Kokkos::Experimental::SYCL,                \
+                                  Kokkos::Experimental::SYCLDeviceUSMSpace>, \
                    Kokkos::MemoryTraits<Kokkos::Unmanaged> >,                \
       Kokkos::View<ORDINAL *, default_layout,                                \
-                   Kokkos::Device<Kokkos::Experimental::SYCL,		     \
-				  Kokkos::Experimental::SYCLDeviceUSMSpace>, \
+                   Kokkos::Device<Kokkos::Experimental::SYCL,                \
+                                  Kokkos::Experimental::SYCLDeviceUSMSpace>, \
                    Kokkos::MemoryTraits<Kokkos::Unmanaged> > > {             \
     enum : bool { value = true };                                            \
   };
