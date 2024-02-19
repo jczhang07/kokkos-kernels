@@ -152,6 +152,15 @@ void spmv(const ExecutionSpace& space,
         std::make_shared<cuSparseSpMVHelper>();
   }
 #endif
+
+#if defined(KOKKOSKERNELS_ENABLE_TPL_ROCSPARSE)
+  // Allocate the spmv helper, which is passed to A_i below and gets populated
+  if (A.roc_spmv_helper == nullptr) {
+    const_cast<AMatrix&>(A).roc_spmv_helper =
+        std::make_shared<rocSparseSpMVHelper>();
+  }
+#endif
+
   typedef KokkosSparse::CrsMatrix<
       typename AMatrix::const_value_type, typename AMatrix::const_ordinal_type,
       typename AMatrix::device_type, Kokkos::MemoryTraits<Kokkos::Unmanaged>,

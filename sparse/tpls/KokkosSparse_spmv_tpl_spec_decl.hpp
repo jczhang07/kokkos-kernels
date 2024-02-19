@@ -408,6 +408,33 @@ KOKKOSSPARSE_SPMV_CUSPARSE(Kokkos::complex<float>, int64_t, size_t,
 #include "KokkosSparse_Utils_rocsparse.hpp"
 
 namespace KokkosSparse {
+
+struct rocSparseSpMVHelper {
+  // Aspmat is shared, but we need two sets of variables for vectors and
+  // buffers: [0] for Y = A X, [1] for Y = A^T X or Y = A^H X
+  bool initialized[2];  // Are the variables initialized?
+  rocsparse_spmat_descr Aspmat;
+  rocsparse_spmv_alg alg[2];
+  rocsparse_dnvec_descr vecX[2], vecY[2];
+  void* buffer[2];
+  size_t buffer_size[2];
+
+  rocSparseSpMVHelper() { initialized[0] = initialized[1] = false; }
+
+  ~rocSparseSpMVHelper() {
+    for (int i = 0; i < 2; i++) {
+      if (initialized[i]) {
+        KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_destroy_dnvec_descr(vecX[i]));
+        KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_destroy_dnvec_descr(vecY[i]));
+        KOKKOS_IMPL_HIP_SAFE_CALL(hipFree(buffer[i]));
+      }
+    }
+    if (initialized[0] || initialized[1]) {
+      KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_destroy_spmat_descr(Aspmat));
+    }
+  }
+};
+
 namespace Impl {
 
 template <class AMatrix, class XVector, class YVector>
@@ -422,25 +449,41 @@ void spmv_rocsparse(const Kokkos::HIP& exec,
   using entry_type  = typename AMatrix::non_const_ordinal_type;
   using value_type  = typename AMatrix::non_const_value_type;
 
-  /* initialize rocsparse library */
+  auto spmv_helper = A.roc_spmv_helper;
+
+  // get a rocSparse handle
   rocsparse_handle handle = controls.getRocsparseHandle();
   /* Set rocsparse to use the given stream until this function exits */
   TemporarySetRocsparseStream(handle, exec);
 
-  /* Set the operation mode */
-  rocsparse_operation myRocsparseOperation = mode_kk_to_rocsparse(mode);
+  // Set the operation mode
+  rocsparse_operation opA = mode_kk_to_rocsparse(mode);
 
-  /* Set the index type */
-  rocsparse_indextype offset_index_type = rocsparse_index_type<offset_type>();
-  rocsparse_indextype entry_index_type  = rocsparse_index_type<entry_type>();
+  // The index selects which of the two sets of
+  // variables to use: 0 for N, 1 for T/H
+  int idx = (opA == rocsparse_operation_none) ? 0 : 1;
 
-  /* Set the scalar type */
-  rocsparse_datatype compute_type = rocsparse_compute_type<value_type>();
+  // Set index and value types
+  rocsparse_indextype row_offset_type = rocsparse_index_type<offset_type>();
+  rocsparse_indextype col_index_type  = rocsparse_index_type<entry_type>();
+  rocsparse_datatype mat_value_type   = rocsparse_compute_type<value_type>();
 
-  /* Create the rocsparse mat and csr descr */
-  rocsparse_mat_descr Amat;
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_create_mat_descr(&Amat));
-  rocsparse_spmat_descr Aspmat;
+  // Note, Dec 6th 2021 - lbv:
+  // rocSPARSE offers two diffrent algorithms for spmv
+  // 1. rocsparse_spmv_alg_csr_adaptive
+  // 2. rocsparse_spmv_alg_csr_stream
+  // it is unclear which one is the default algorithm
+  // or what both algorithms are intended for?
+
+  rocsparse_spmv_alg alg = rocsparse_spmv_alg_default;
+  if (controls.isParameter("algorithm")) {
+    const std::string algName = controls.getParameter("algorithm");
+    if (algName == "default")
+      alg = rocsparse_spmv_alg_default;
+    else if (algName == "merge")
+      alg = rocsparse_spmv_alg_csr_stream;
+  }
+
   // We need to do some casting to void*
   // Note that row_map is always a const view so const_cast is necessary,
   // however entries and values may not be const so we need to check first.
@@ -450,76 +493,84 @@ void spmv_rocsparse(const Kokkos::HIP& exec,
       static_cast<void*>(const_cast<entry_type*>(A.graph.entries.data()));
   void* csr_val = static_cast<void*>(const_cast<value_type*>(A.values.data()));
 
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_create_csr_descr(
-      &Aspmat, A.numRows(), A.numCols(), A.nnz(), csr_row_ptr, csr_col_ind,
-      csr_val, offset_index_type, entry_index_type, rocsparse_index_base_zero,
-      compute_type));
-
-  /* Create rocsparse dense vectors for X and Y */
-  rocsparse_dnvec_descr vecX, vecY;
   void* x_data = static_cast<void*>(
       const_cast<typename XVector::non_const_value_type*>(x.data()));
   void* y_data = static_cast<void*>(
       const_cast<typename YVector::non_const_value_type*>(y.data()));
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_create_dnvec_descr(
-      &vecX, x.extent_int(0), x_data,
-      rocsparse_compute_type<typename XVector::non_const_value_type>()));
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_create_dnvec_descr(
-      &vecY, y.extent_int(0), y_data,
-      rocsparse_compute_type<typename YVector::non_const_value_type>()));
 
-  /* Actually perform the SpMV operation, first size buffer, then compute result
-   */
-  size_t buffer_size     = 0;
-  void* tmp_buffer       = nullptr;
-  rocsparse_spmv_alg alg = rocsparse_spmv_alg_default;
-  // Note, Dec 6th 2021 - lbv:
-  // rocSPARSE offers two diffrent algorithms for spmv
-  // 1. ocsparse_spmv_alg_csr_adaptive
-  // 2. rocsparse_spmv_alg_csr_stream
-  // it is unclear which one is the default algorithm
-  // or what both algorithms are intended for?
-  if (controls.isParameter("algorithm")) {
-    const std::string algName = controls.getParameter("algorithm");
-    if (algName == "default")
-      alg = rocsparse_spmv_alg_default;
-    else if (algName == "merge")
-      alg = rocsparse_spmv_alg_csr_stream;
+  // Create or update mat descr
+  if (!spmv_helper->initialized[0] && !spmv_helper->initialized[1]) {
+    KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_create_csr_descr(
+        &spmv_helper->Aspmat, A.numRows(), A.numCols(), A.nnz(), csr_row_ptr,
+        csr_col_ind, csr_val, row_offset_type, col_index_type,
+        rocsparse_index_base_zero, mat_value_type));
+  } else {
+    // Update Aspmat pointers so that even if A has new pointers, we are
+    // still good
+    KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_csr_set_pointers(
+        spmv_helper->Aspmat, csr_row_ptr, csr_col_ind, csr_val));
   }
 
-#if KOKKOSSPARSE_IMPL_ROCM_VERSION >= 60000
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(
-      rocsparse_spmv(handle, myRocsparseOperation, &alpha, Aspmat, vecX, &beta,
-                     vecY, compute_type, alg, rocsparse_spmv_stage_buffer_size,
-                     &buffer_size, tmp_buffer));
-  KOKKOS_IMPL_HIP_SAFE_CALL(hipMalloc(&tmp_buffer, buffer_size));
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(
-      rocsparse_spmv(handle, myRocsparseOperation, &alpha, Aspmat, vecX, &beta,
-                     vecY, compute_type, alg, rocsparse_spmv_stage_compute,
-                     &buffer_size, tmp_buffer));
-#elif KOKKOSSPARSE_IMPL_ROCM_VERSION >= 50400
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_spmv_ex(
-      handle, myRocsparseOperation, &alpha, Aspmat, vecX, &beta, vecY,
-      compute_type, alg, rocsparse_spmv_stage_auto, &buffer_size, tmp_buffer));
-  KOKKOS_IMPL_HIP_SAFE_CALL(hipMalloc(&tmp_buffer, buffer_size));
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_spmv_ex(
-      handle, myRocsparseOperation, &alpha, Aspmat, vecX, &beta, vecY,
-      compute_type, alg, rocsparse_spmv_stage_auto, &buffer_size, tmp_buffer));
-#else
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(
-      rocsparse_spmv(handle, myRocsparseOperation, &alpha, Aspmat, vecX, &beta,
-                     vecY, compute_type, alg, &buffer_size, tmp_buffer));
-  KOKKOS_IMPL_HIP_SAFE_CALL(hipMalloc(&tmp_buffer, buffer_size));
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(
-      rocsparse_spmv(handle, myRocsparseOperation, &alpha, Aspmat, vecX, &beta,
-                     vecY, compute_type, alg, &buffer_size, tmp_buffer));
-#endif
-  KOKKOS_IMPL_HIP_SAFE_CALL(hipFree(tmp_buffer));
+  // Create or update VecX/Y
+  if (!spmv_helper->initialized[idx]) {
+    // Create rocsparse dense vectors for X and Y
+    KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_create_dnvec_descr(
+        &spmv_helper->vecX[idx], x.extent_int(0), x_data,
+        rocsparse_compute_type<typename XVector::non_const_value_type>()));
+    KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_create_dnvec_descr(
+        &spmv_helper->vecY[idx], y.extent_int(0), y_data,
+        rocsparse_compute_type<typename YVector::non_const_value_type>()));
+  } else {
+    // Update vecX/Y pointers so that even if x/y have new pointers, we
+    // are still good
+    KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(
+        rocsparse_dnvec_set_values(spmv_helper->vecX[idx], x_data));
+    KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(
+        rocsparse_dnvec_set_values(spmv_helper->vecY[idx], y_data));
+  }
 
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_destroy_dnvec_descr(vecY));
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_destroy_dnvec_descr(vecX));
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_destroy_spmat_descr(Aspmat));
-  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_destroy_mat_descr(Amat));
+  // Allocate buffer when not initialized or algorithm changed
+  if (!spmv_helper->initialized[idx] || alg != spmv_helper->alg[idx]) {
+    if (spmv_helper->buffer[idx]) KOKKOS_IMPL_HIP_SAFE_CALL(hipFree(spmv_helper->buffer[idx]));
+#if KOKKOSSPARSE_IMPL_ROCM_VERSION >= 50400
+    KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_spmv_ex(
+        handle, opA, &alpha, spmv_helper->Aspmat, spmv_helper->vecX[idx], &beta,
+        spmv_helper->vecY[idx], mat_value_type, alg, rocsparse_spmv_stage_buffer_size,
+        &spmv_helper->buffer_size[idx], nullptr));
+#else
+    KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_spmv(
+        handle, opA, &alpha, spmv_helper->Aspmat, spmv_helper->vecX[idx], &beta,
+        spmv_helper->vecY[idx], mat_value_type, alg,
+        &spmv_helper->buffer_size[idx], nullptr));
+#endif
+
+    KOKKOS_IMPL_HIP_SAFE_CALL(
+        hipMalloc(&spmv_helper->buffer[idx], spmv_helper->buffer_size[idx]));
+
+#if KOKKOSSPARSE_IMPL_ROCM_VERSION >= 50400
+    KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_spmv_ex(
+        handle, opA, &alpha, spmv_helper->Aspmat, spmv_helper->vecX[idx], &beta,
+        spmv_helper->vecY[idx], mat_value_type, alg, rocsparse_spmv_stage_preprocess,
+        &spmv_helper->buffer_size[idx], spmv_helper->buffer[idx]));
+#endif
+
+    spmv_helper->alg[idx]         = alg;  // cache the alg used
+    spmv_helper->initialized[idx] = true;
+  }
+
+  // Do the SpMV operation
+#if KOKKOSSPARSE_IMPL_ROCM_VERSION >= 50400
+  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_spmv_ex(
+      handle, opA, &alpha, spmv_helper->Aspmat, spmv_helper->vecX[idx], &beta,
+      spmv_helper->vecY[idx], mat_value_type, alg, rocsparse_spmv_stage_compute,
+      &spmv_helper->buffer_size[idx], spmv_helper->buffer[idx]));
+#else
+  KOKKOS_ROCSPARSE_SAFE_CALL_IMPL(rocsparse_spmv(
+      handle, opA, &alpha, spmv_helper->Aspmat, spmv_helper->vecX[idx], &beta,
+      spmv_helper->vecY[idx], mat_value_type, alg,
+      &spmv_helper->buffer_size[idx], spmv_helper->buffer[idx]));
+#endif
+
 }
 
 #define KOKKOSSPARSE_SPMV_ROCSPARSE(SCALAR, LAYOUT, COMPILE_LIBRARY)          \

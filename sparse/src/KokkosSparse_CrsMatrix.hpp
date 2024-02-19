@@ -331,6 +331,11 @@ struct SparseRowViewConst {
 struct cuSparseSpMVHelper;
 #endif
 
+#ifdef KOKKOSKERNELS_ENABLE_TPL_ROCSPARSE
+// foward declaration
+struct rocSparseSpMVHelper;
+#endif
+
 /// \class CrsMatrix
 /// \brief Compressed sparse row implementation of a sparse matrix.
 /// \tparam ScalarType The type of entries in the sparse matrix.
@@ -444,6 +449,10 @@ class CrsMatrix {
   /// state mechanism.
   DeviceConfig dev_config;
 
+#ifdef KOKKOSKERNELS_ENABLE_TPL_ROCSPARSE
+  std::shared_ptr<rocSparseSpMVHelper> roc_spmv_helper;
+#endif
+
 #ifdef KOKKOSKERNELS_ENABLE_TPL_CUSPARSE
   std::shared_ptr<cuSparseSpMVHelper> cuda_spmv_helper;
 #endif
@@ -475,6 +484,10 @@ class CrsMatrix {
         ,
         cuda_spmv_helper(B.cuda_spmv_helper)
 #endif
+#if defined(KOKKOSKERNELS_ENABLE_TPL_ROCSPARSE)
+        ,
+        roc_spmv_helper(B.roc_spmv_helper)
+#endif
   {
     graph.row_block_offsets = B.graph.row_block_offsets;
     // TODO: MD 07/2017: Changed the copy constructor of graph
@@ -491,6 +504,10 @@ class CrsMatrix {
 #ifdef KOKKOSKERNELS_ENABLE_TPL_CUSPARSE
         ,
         cuda_spmv_helper(mat_.cuda_spmv_helper)
+#endif
+#if defined(KOKKOSKERNELS_ENABLE_TPL_ROCSPARSE)
+        ,
+        roc_spmv_helper(mat_.roc_spmv_helper)
 #endif
     {
       typename row_map_type::non_const_type rowmap(
@@ -746,6 +763,9 @@ class CrsMatrix {
       dev_config = mtx.dev_config;
 #ifdef KOKKOSKERNELS_ENABLE_TPL_CUSPARSE
       cuda_spmv_helper = mtx.cuda_spmv_helper;
+#endif
+#ifdef KOKKOSKERNELS_ENABLE_TPL_ROCSPARSE
+      roc_spmv_helper = mtx.roc_spmv_helper;
 #endif
       return *this;
     }
